@@ -1,0 +1,118 @@
+// ---------------------------------------------------------------------------
+// Prisma schema for the collaborative editor.
+//
+// Design notes (worth understanding, not just pasting):
+//
+// 1. We never store "the document" as a single mutable blob that gets
+//    overwritten on every save. Instead DocumentUpdate is an APPEND-ONLY log
+//    of Yjs CRDT binary updates. Appending is what makes concurrent offline
+//    edits from multiple clients mergeable without a conflict: two clients
+//    that were offline can each push their update log and Yjs guarantees the
+//    merge is deterministic and order-independent (see lib/sync/sync-engine.ts
+//    and lib/crdt/README in the repo root for the full explanation).
+//
+// 2. DocumentSnapshot is a separate, periodically-compacted materialization
+//    of "apply updates 1..N" so that (a) old clients don't have to replay an
+//    unbounded update log from scratch, and (b) Version History / time-travel
+//    has cheap, named checkpoints to restore to.
+//
+// 3. Access control is modeled explicitly via DocumentCollaborator.role
+//    rather than embedding permissions in JWT claims, so a role change takes
+//    effect immediately without waiting for token refresh. Every query in
+//    lib/db/prisma.ts scopes through this table (see rbac.ts) — that's our
+//    tenant isolation / "RLS-equivalent" strategy at the ORM layer.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  EDITOR
+  VIEWER
+}
+
+model User {
+  id            String   @id @default(cuid())
+  name          String?
+  email         String   @unique
+  passwordHash  String?
+  createdAt     DateTime @default(now())
+
+  collaborations DocumentCollaborator[]
+  updates        DocumentUpdate[]
+  snapshots      DocumentSnapshot[]
+}
+
+model Document {
+  id        String   @id @default(cuid())
+  title     String   @default("Untitled Document")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Size guardrail: track running byte size of the update log so we can
+  // trigger compaction (squash into a fresh snapshot + truncate log) before
+  // it grows unbounded. See lib/sync/compaction.ts.
+  logSizeBytes Int @default(0)
+
+  collaborators DocumentCollaborator[]
+  updates       DocumentUpdate[]
+  snapshots     DocumentSnapshot[]
+}
+
+model DocumentCollaborator {
+  id         String   @id @default(cuid())
+  documentId String
+  userId     String
+  role       Role     @default(VIEWER)
+  addedAt    DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, userId])
+  @@index([userId])
+}
+
+// Append-only CRDT update log. Each row is one Yjs update (binary diff),
+// never mutated after insert. This is what makes sync idempotent and safe
+// to retry: replaying the same row twice is a no-op because Yjs updates are
+// idempotent when re-applied to a doc that already has them.
+model DocumentUpdate {
+  id          String   @id @default(cuid())
+  documentId  String
+  authorId    String
+  clientMsgId String // client-generated UUID, used for de-duplication on retry
+  update      Bytes // raw Yjs update bytes
+  sizeBytes   Int
+  createdAt   DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  author   User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, clientMsgId]) // idempotency key
+  @@index([documentId, createdAt])
+}
+
+// Named checkpoints for Version History / time-travel, plus the periodic
+// compaction snapshots created by lib/sync/compaction.ts.
+model DocumentSnapshot {
+  id         String   @id @default(cuid())
+  documentId String
+  authorId   String
+  label      String? // null for auto-compaction snapshots, set for manual "save version"
+  state      Bytes // full Yjs document state vector snapshot (Y.encodeStateAsUpdate)
+  isAuto     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  author   User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([documentId, createdAt])
+}
